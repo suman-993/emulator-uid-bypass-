@@ -1,490 +1,805 @@
-import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
-import subprocess
-import os
-import sys
-import time
-import re
+import json
+import logging
 import random
 import threading
-import psutil
-from datetime import datetime
+import time
+import os
+import sys
+import subprocess
+import requests
+from mitmproxy import http, options
+from mitmproxy.tools import dump
+import re
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext, filedialog
+import tempfile
+import shutil
+from pathlib import Path
 
-class FreeFireBypassTool:
+# Configuration
+WHITELIST_FILE = 'whitelist.json'
+LOG_FILE = 'server.log'
+PROXY_PORT = 5555
+CERTIFICATE_URL = "http://mitm.it/cert/pem"
+ADB_PATH = "adb"  # Will try to find ADB in PATH
+
+# Initialize logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler()
+    ]
+)
+
+# Load or initialize whitelist
+def load_whitelist():
+    try:
+        with open(WHITELIST_FILE, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def save_whitelist(whitelist):
+    with open(WHITELIST_FILE, 'w') as f:
+        json.dump(whitelist, f, indent=4)
+
+def is_uid_whitelisted(uid):
+    whitelist = load_whitelist()
+    return uid in whitelist
+
+def add_uid_to_whitelist(uid):
+    whitelist = load_whitelist()
+    if uid not in whitelist:
+        whitelist.append(uid)
+        save_whitelist(whitelist)
+        logging.info(f"Added UID {uid} to whitelist")
+    else:
+        logging.info(f"UID {uid} is already in whitelist")
+
+# MSI App Player specific detection patterns
+MSI_PATTERNS = [
+    "msi", "msi app player", "4.240.15.6305", "bluestacks", "bst", "bstwebruntime",
+    "android sdk built for x86", "emulator", "vbox", "virtualbox", "qemu", "goldfish"
+]
+
+# Device profiles optimized for MSI App Player
+MOBILE_PROFILES = {
+    "samsung_galaxy_s20": {
+        "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 11; SM-G981B Build/RP1A.200720.012; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/87.0.4280.141 Mobile Safari/537.36",
+        "X-Requested-With": "com.dts.freefireth",
+        "Device-ID": "android-28c7d93a4b6e1f5g",
+        "Device-Info": "Android 11; SM-G981B; samsung; samsung; en_US",
+        "Screen-Resolution": "1080x2400",
+        "Device-Model": "SM-G981B",
+        "Device-Brand": "samsung",
+        "Device-Manufacturer": "samsung",
+        "Device-OS": "Android",
+        "Device-OS-Version": "11",
+        "Device-Hardware": "exynos990",
+        "Network-Type": "WIFI",
+        "Carrier": "Android",
+        "Country": "US",
+        "Language": "en"
+    },
+    "xiaomi_redmi_note_10": {
+        "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 11; Redmi Note 10 Pro Build/RKQ1.200826.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/89.0.4389.105 Mobile Safari/537.36",
+        "X-Requested-With": "com.dts.freefireth",
+        "Device-ID": "android-39d8e74b5c2f1a6h",
+        "Device-Info": "Android 11; Redmi Note 10 Pro; xiaomi; Redmi; en_US",
+        "Screen-Resolution": "1080x2400",
+        "Device-Model": "Redmi Note 10 Pro",
+        "Device-Brand": "xiaomi",
+        "Device-Manufacturer": "xiaomi",
+        "Device-OS": "Android",
+        "Device-OS-Version": "11",
+        "Device-Hardware": "sm7125",
+        "Network-Type": "WIFI",
+        "Carrier": "Android",
+        "Country": "US",
+        "Language": "en"
+    },
+    "oneplus_8t": {
+        "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 11; KB2003 Build/RP1A.201005.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/87.0.4280.141 Mobile Safari/537.36",
+        "X-Requested-With": "com.dts.freefireth",
+        "Device-ID": "android-47f9a83b6d2e1c7i",
+        "Device-Info": "Android 11; KB2003; OnePlus; OnePlus8T; en_US",
+        "Screen-Resolution": "1080x2400",
+        "Device-Model": "KB2003",
+        "Device-Brand": "OnePlus",
+        "Device-Manufacturer": "OnePlus",
+        "Device-OS": "Android",
+        "Device-OS-Version": "11",
+        "Device-Hardware": "sm8250",
+        "Network-Type": "WIFI",
+        "Carrier": "Android",
+        "Country": "US",
+        "Language": "en"
+    }
+}
+
+# Known Free Fire server domains
+FREE_FIRE_DOMAINS = [
+    "freefiremobile.com", "garena.com", "garenanow.com", "dtsfreefire.com",
+    "gameapi.freefiremobile.com", "api.freefiremobile.com", "patch.freefiremobile.com",
+    "ffinfo.freefiremobile.com", "login.freefiremobile.com", "settings.freefiremobile.com"
+]
+
+# Mitmproxy addon to modify requests and responses
+class FreeFireProxy:
+    def __init__(self, profile_name="samsung_galaxy_s20"):
+        self.whitelisted_uid = "default_whitelisted_uid"
+        self.current_profile = profile_name
+        logging.info(f"Free Fire Proxy initialized with profile: {self.current_profile}")
+        logging.info(f"MSI App Player 4.240.15.6305 detected - applying specialized transformations")
+
+    def is_freefire_request(self, flow):
+        """Check if this is a Free Fire related request"""
+        host = flow.request.host.lower()
+        return any(domain in host for domain in FREE_FIRE_DOMAINS)
+
+    def is_msi_emulator_detected(self, flow):
+        """Check if the request contains MSI emulator indicators"""
+        # Check headers
+        for header, value in flow.request.headers.items():
+            if any(pattern in value.lower() for pattern in MSI_PATTERNS):
+                return True
+        
+        # Check body for emulator indicators
+        if flow.request.content:
+            try:
+                content = flow.request.content.decode('utf-8', errors='ignore').lower()
+                if any(pattern in content for pattern in MSI_PATTERNS):
+                    return True
+            except:
+                pass
+                
+        return False
+
+    def request(self, flow: http.HTTPFlow) -> None:
+        try:
+            if self.is_freefire_request(flow):
+                profile = MOBILE_PROFILES[self.current_profile]
+                
+                # Log original request details
+                original_ua = flow.request.headers.get("User-Agent", "")
+                logging.info(f"Processing Free Fire request to: {flow.request.host}")
+                
+                # Check for MSI emulator detection
+                if self.is_msi_emulator_detected(flow):
+                    logging.warning("MSI emulator detection patterns found! Applying specialized phone transformation.")
+                
+                # Apply mobile phone profile to headers
+                for header, value in profile.items():
+                    flow.request.headers[header] = value
+                
+                # Handle UID modification
+                uid = flow.request.headers.get("X-UID") or flow.request.headers.get("x-uid") or flow.request.headers.get("UID")
+                if uid:
+                    if is_uid_whitelisted(uid):
+                        logging.info(f"Whitelisted UID {uid} allowed to connect.")
+                    else:
+                        flow.request.headers["X-UID"] = self.whitelisted_uid
+                        logging.info(f"Modified UID from {uid} to {self.whitelisted_uid}")
+                else:
+                    # Add UID if missing
+                    flow.request.headers["X-UID"] = self.whitelisted_uid
+                    logging.info(f"Added UID: {self.whitelisted_uid}")
+                
+                # Special handling for MSI-specific headers
+                if "Bluestacks" in original_ua or "MSI" in original_ua:
+                    flow.request.headers["X-Bluestacks-Sku"] = "MSI"
+                    flow.request.headers["X-Original-User-Agent"] = original_ua
+                
+                # Modify request body if it contains device info
+                if flow.request.content:
+                    try:
+                        content = flow.request.content.decode('utf-8')
+                        
+                        # Replace MSI emulator indicators in body
+                        for pattern in MSI_PATTERNS:
+                            if pattern in content.lower():
+                                replacement = self.current_profile.split('_')[1]
+                                content = re.sub(
+                                    pattern, 
+                                    replacement, 
+                                    content, 
+                                    flags=re.IGNORECASE
+                                )
+                        
+                        # Update device info in JSON body if present
+                        if any(keyword in content.lower() for keyword in ['device', 'model', 'hardware', 'emulator']):
+                            try:
+                                data = json.loads(content)
+                                if 'device' in data:
+                                    if 'model' in data['device']:
+                                        data['device']['model'] = profile['Device-Model']
+                                    if 'brand' in data['device']:
+                                        data['device']['brand'] = profile['Device-Brand']
+                                    if 'manufacturer' in data['device']:
+                                        data['device']['manufacturer'] = profile['Device-Manufacturer']
+                                    if 'hardware' in data['device']:
+                                        data['device']['hardware'] = profile['Device-Hardware']
+                                content = json.dumps(data)
+                            except:
+                                # If not JSON, try to modify as text
+                                content = content.replace('MSI', profile['Device-Brand'])
+                                content = content.replace('msi', profile['Device-Brand'].lower())
+                                content = content.replace('Bluestacks', profile['Device-Brand'])
+                                content = content.replace('bluestacks', profile['Device-Brand'].lower())
+                        
+                        flow.request.content = content.encode('utf-8')
+                    except Exception as e:
+                        logging.error(f"Error modifying request content: {e}")
+                
+                logging.info(f"Transformed MSI request to appear as: {profile['Device-Model']}")
+                
+        except Exception as e:
+            logging.error(f"Error modifying request: {e}")
+
+    def response(self, flow: http.HTTPFlow) -> None:
+        try:
+            if self.is_freefire_request(flow):
+                # Check if the response contains emulator detection or ban warnings
+                content_type = flow.response.headers.get("Content-Type", "").lower()
+                
+                if flow.response.content:
+                    try:
+                        content = flow.response.content.decode('utf-8')
+                        
+                        # Check for ban or emulator detection responses
+                        detection_keywords = ['emulator', 'ban', 'cheat', 'invalid', 'suspicious', 'msi', 'bluestacks']
+                        if any(keyword in content.lower() for keyword in detection_keywords):
+                            logging.warning(f"Potential detection in response from: {flow.request.host}")
+                            
+                            # Try to parse and modify JSON response
+                            if "application/json" in content_type:
+                                try:
+                                    data = json.loads(content)
+                                    if 'message' in data and any(keyword in str(data['message']).lower() for keyword in detection_keywords):
+                                        data['message'] = "Success"
+                                        data['status'] = 1
+                                        flow.response.content = json.dumps(data).encode('utf-8')
+                                        logging.info("Modified suspicious JSON response")
+                                except:
+                                    pass
+                            else:
+                                # If not JSON, try to modify text response
+                                for keyword in detection_keywords:
+                                    if keyword in content.lower():
+                                        content = content.replace(keyword, 'device')
+                                        content = content.replace(keyword.capitalize(), 'Device')
+                                flow.response.content = content.encode('utf-8')
+                                logging.info("Modified text response with detection keywords")
+                    except:
+                        pass
+                        
+        except Exception as e:
+            logging.error(f"Error modifying response: {e}")
+
+# ADB functions for automatic certificate installation
+class ADBHelper:
+    def __init__(self):
+        self.adb_path = self.find_adb()
+        
+    def find_adb(self):
+        """Try to find ADB executable"""
+        # Check common locations
+        possible_paths = [
+            "adb",
+            "platform-tools/adb",
+            os.path.join(os.environ.get("ANDROID_HOME", ""), "platform-tools", "adb"),
+            os.path.join(os.environ.get("USERPROFILE", ""), "AppData", "Local", "Android", "Sdk", "platform-tools", "adb.exe")
+        ]
+        
+        for path in possible_paths:
+            try:
+                subprocess.run([path, "version"], capture_output=True, check=True)
+                return path
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                continue
+        
+        return None
+    
+    def check_device_connected(self):
+        """Check if an Android device is connected via ADB"""
+        if not self.adb_path:
+            return False, "ADB not found"
+        
+        try:
+            result = subprocess.run([self.adb_path, "devices"], capture_output=True, text=True, check=True)
+            lines = result.stdout.strip().split('\n')
+            
+            # Check if any device is connected (excluding header line)
+            if len(lines) > 1 and "device" in lines[1]:
+                return True, "Device connected"
+            else:
+                return False, "No device connected"
+        except subprocess.CalledProcessError as e:
+            return False, f"ADB error: {e}"
+    
+    def install_certificate(self, cert_path):
+        """Install certificate on Android device"""
+        if not self.adb_path:
+            return False, "ADB not found"
+        
+        try:
+            # Push certificate to device
+            subprocess.run([self.adb_path, "push", cert_path, "/sdcard/mitmproxy-ca-cert.cer"], 
+                          capture_output=True, check=True)
+            
+            # Try to install the certificate
+            result = subprocess.run([
+                self.adb_path, "shell", 
+                "su -c", 
+                "mv /sdcard/mitmproxy-ca-cert.cer /system/etc/security/cacerts/ &&",
+                "chmod 644 /system/etc/security/cacerts/mitmproxy-ca-cert.cer"
+            ], capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                return True, "Certificate installed successfully"
+            else:
+                # Fallback to user certificate installation
+                return self.install_user_certificate(cert_path)
+                
+        except subprocess.CalledProcessError as e:
+            return False, f"Certificate installation failed: {e}"
+    
+    def install_user_certificate(self, cert_path):
+        """Install certificate as user certificate (non-root)"""
+        try:
+            # For non-root devices, we need to use the settings command
+            # This method may not work on all Android versions
+            subprocess.run([self.adb_path, "push", cert_path, "/sdcard/mitmproxy-ca-cert.cer"], 
+                          capture_output=True, check=True)
+            
+            # Try to install via security settings (may require user interaction)
+            subprocess.run([self.adb_path, "shell", "am", "start", 
+                          "-a", "android.intent.action.VIEW", 
+                          "-t", "application/x-x509-ca-cert", 
+                          "-d", "file:///sdcard/mitmproxy-ca-cert.cer"], 
+                         capture_output=True)
+            
+            return True, "Certificate pushed to device. Please complete installation manually in the emulator."
+            
+        except subprocess.CalledProcessError as e:
+            return False, f"User certificate installation failed: {e}"
+    
+    def set_proxy(self, host, port):
+        """Set proxy settings on Android device"""
+        if not self.adb_path:
+            return False, "ADB not found"
+        
+        try:
+            # Set global HTTP proxy
+            subprocess.run([
+                self.adb_path, "shell", 
+                "settings put global http_proxy", f"{host}:{port}"
+            ], capture_output=True, check=True)
+            
+            return True, f"Proxy set to {host}:{port}"
+        except subprocess.CalledProcessError as e:
+            return False, f"Proxy setting failed: {e}"
+    
+    def clear_proxy(self):
+        """Clear proxy settings"""
+        if not self.adb_path:
+            return False, "ADB not found"
+        
+        try:
+            subprocess.run([
+                self.adb_path, "shell",
+                "settings put global http_proxy :0"
+            ], capture_output=True, check=True)
+            return True, "Proxy cleared"
+        except subprocess.CalledProcessError as e:
+            return False, f"Failed to clear proxy: {e}"
+
+# GUI Application
+class FreeFireProxyGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Free Fire Emulator Bypass Tool")
-        self.root.geometry("900x650")
+        self.root.title("Free Fire MSI App Player Protection")
+        self.root.geometry("900x700")
         self.root.resizable(True, True)
         
-        # Variables
-        self.adb_path = tk.StringVar(value="adb")
-        self.emulator_port = tk.StringVar(value="5555")
+        # Proxy variables
+        self.proxy_thread = None
+        self.proxy = None
         self.is_running = False
-        self.process = None
         
+        # ADB helper
+        self.adb_helper = ADBHelper()
+        
+        # Create GUI
         self.create_widgets()
         
+        # Load whitelist
+        self.load_whitelist()
+        
+        # Set default profile
+        self.current_profile = "samsung_galaxy_s20"
+        
+        # Check ADB status
+        self.check_adb_status()
+        
     def create_widgets(self):
-        # Notebook for tabs
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        # Create tabs
+        tab_control = ttk.Notebook(self.root)
         
         # Main tab
-        main_frame = ttk.Frame(notebook, padding=10)
-        notebook.add(main_frame, text="Bypass Control")
+        self.main_tab = ttk.Frame(tab_control)
+        tab_control.add(self.main_tab, text='Main Control')
         
-        # Settings frame
-        settings_frame = ttk.LabelFrame(main_frame, text="Settings", padding=10)
-        settings_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5)
-        settings_frame.columnconfigure(1, weight=1)
+        # Settings tab
+        self.settings_tab = ttk.Frame(tab_control)
+        tab_control.add(self.settings_tab, text='Settings')
         
-        ttk.Label(settings_frame, text="ADB Path:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        ttk.Entry(settings_frame, textvariable=self.adb_path, width=40).grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
+        # Logs tab
+        self.logs_tab = ttk.Frame(tab_control)
+        tab_control.add(self.logs_tab, text='Logs')
         
-        ttk.Label(settings_frame, text="Emulator Port:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        ttk.Entry(settings_frame, textvariable=self.emulator_port, width=10).grid(row=1, column=1, sticky=tk.W, padx=5, pady=5)
+        tab_control.pack(expand=1, fill='both')
         
-        # Emulator type
-        ttk.Label(settings_frame, text="Emulator Type:").grid(row=2, column=0, sticky=tk.W, pady=5)
-        self.emulator_type = ttk.Combobox(settings_frame, values=["LDPlayer", "Nox", "BlueStacks", "Memu", "Generic"], state="readonly")
-        self.emulator_type.set("LDPlayer")
-        self.emulator_type.grid(row=2, column=1, sticky=tk.W, padx=5, pady=5)
+        # Main tab content
+        self.create_main_tab()
         
-        # Buttons frame
-        buttons_frame = ttk.Frame(main_frame)
-        buttons_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=10)
+        # Settings tab content
+        self.create_settings_tab()
         
-        self.start_btn = ttk.Button(buttons_frame, text="Start Bypass", command=self.start_bypass)
-        self.start_btn.pack(side=tk.LEFT, padx=5)
+        # Logs tab content
+        self.create_logs_tab()
         
-        self.stop_btn = ttk.Button(buttons_frame, text="Stop Bypass", command=self.stop_bypass, state=tk.DISABLED)
-        self.stop_btn.pack(side=tk.LEFT, padx=5)
+    def create_main_tab(self):
+        # Status frame
+        status_frame = ttk.LabelFrame(self.main_tab, text="Status", padding=10)
+        status_frame.pack(fill='x', padx=10, pady=5)
         
-        ttk.Button(buttons_frame, text="Check Connection", command=self.check_connection).pack(side=tk.LEFT, padx=5)
-        ttk.Button(buttons_frame, text="Advanced Methods", command=self.show_advanced_methods).pack(side=tk.LEFT, padx=5)
-        ttk.Button(buttons_frame, text="Reboot Device", command=self.reboot_device).pack(side=tk.LEFT, padx=5)
-        ttk.Button(buttons_frame, text="Install Modules", command=self.show_module_help).pack(side=tk.LEFT, padx=5)
+        self.adb_status = ttk.Label(status_frame, text="ADB: Checking...")
+        self.adb_status.pack(anchor='w')
         
-        # Log frame
-        log_frame = ttk.LabelFrame(main_frame, text="Log", padding=10)
-        log_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
-        main_frame.columnconfigure(0, weight=1)
-        main_frame.rowconfigure(2, weight=1)
+        self.proxy_status = ttk.Label(status_frame, text="Proxy: Stopped")
+        self.proxy_status.pack(anchor='w')
         
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=15)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
+        self.cert_status = ttk.Label(status_frame, text="Certificate: Not installed")
+        self.cert_status.pack(anchor='w')
         
-        # Methods tab
-        methods_frame = ttk.Frame(notebook, padding=10)
-        notebook.add(methods_frame, text="Bypass Methods")
+        # Control frame
+        control_frame = ttk.LabelFrame(self.main_tab, text="Control", padding=10)
+        control_frame.pack(fill='x', padx=10, pady=5)
         
-        methods = [
-            "✓ ADB Connection Spoofing (127.0.0.1:5555)",
-            "✓ Device Fingerprint Spoofing (ROG Phone 2)",
-            "⚠ Root Detection Bypass (Needs Magisk)",
-            "✓ Emulator Detection Bypass",
-            "✓ UID/IMEI Spoofing",
-            "✓ Memory/Process Hiding",
-            "✓ Network Traffic Manipulation",
-            "⚠ Sensor Data Spoofing (Manual needed)",
-            "✓ Debugging Detection Bypass",
-            "⚠ Game Binary Modification (Manual needed)"
-        ]
+        # Profile selection
+        ttk.Label(control_frame, text="Device Profile:").grid(row=0, column=0, sticky='w', pady=5)
+        self.profile_var = tk.StringVar(value=self.current_profile)
+        profile_combo = ttk.Combobox(control_frame, textvariable=self.profile_var, 
+                                    values=list(MOBILE_PROFILES.keys()), state='readonly')
+        profile_combo.grid(row=0, column=1, sticky='ew', padx=5, pady=5)
+        profile_combo.bind('<<ComboboxSelected>>', self.on_profile_change)
         
-        for i, method in enumerate(methods):
-            ttk.Label(methods_frame, text=method).grid(row=i, column=0, sticky=tk.W, pady=2)
+        # Proxy controls
+        button_frame = ttk.Frame(control_frame)
+        button_frame.grid(row=1, column=0, columnspan=2, pady=10)
         
-        # Status bar
-        self.status_var = tk.StringVar(value="Ready")
-        status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN)
-        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
-    
-    def log_message(self, message):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
-        self.log_text.see(tk.END)
-        self.status_var.set(message)
-    
-    def run_command(self, command, shell=False):
+        self.start_btn = ttk.Button(button_frame, text="Start Proxy", command=self.start_proxy)
+        self.start_btn.pack(side='left', padx=5)
+        
+        self.stop_btn = ttk.Button(button_frame, text="Stop Proxy", command=self.stop_proxy, state='disabled')
+        self.stop_btn.pack(side='left', padx=5)
+        
+        # Setup frame
+        setup_frame = ttk.LabelFrame(self.main_tab, text="Setup", padding=10)
+        setup_frame.pack(fill='x', padx=10, pady=5)
+        
+        ttk.Button(setup_frame, text="Install Certificate", 
+                  command=self.install_certificate).pack(side='left', padx=5)
+        
+        ttk.Button(setup_frame, text="Set Proxy", 
+                  command=self.set_proxy).pack(side='left', padx=5)
+        
+        ttk.Button(setup_frame, text="Clear Proxy", 
+                  command=self.clear_proxy).pack(side='left', padx=5)
+        
+        ttk.Button(setup_frame, text="Full Auto Setup", 
+                  command=self.full_auto_setup).pack(side='left', padx=5)
+        
+    def create_settings_tab(self):
+        # Whitelist management
+        whitelist_frame = ttk.LabelFrame(self.settings_tab, text="UID Whitelist", padding=10)
+        whitelist_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        # Whitelist listbox
+        self.whitelist_listbox = tk.Listbox(whitelist_frame, height=10)
+        self.whitelist_listbox.pack(fill='both', expand=True, pady=5)
+        
+        # Whitelist controls
+        control_frame = ttk.Frame(whitelist_frame)
+        control_frame.pack(fill='x', pady=5)
+        
+        self.uid_entry = ttk.Entry(control_frame)
+        self.uid_entry.pack(side='left', fill='x', expand=True, padx=5)
+        
+        ttk.Button(control_frame, text="Add UID", 
+                  command=self.add_uid).pack(side='left', padx=5)
+        
+        ttk.Button(control_frame, text="Remove Selected", 
+                  command=self.remove_uid).pack(side='left', padx=5)
+        
+        ttk.Button(control_frame, text="Clear All", 
+                  command=self.clear_whitelist).pack(side='left', padx=5)
+        
+        # Advanced settings
+        advanced_frame = ttk.LabelFrame(self.settings_tab, text="Advanced", padding=10)
+        advanced_frame.pack(fill='x', padx=10, pady=5)
+        
+        ttk.Label(advanced_frame, text="Proxy Port:").grid(row=0, column=0, sticky='w', pady=5)
+        self.port_var = tk.StringVar(value=str(PROXY_PORT))
+        ttk.Entry(advanced_frame, textvariable=self.port_var, width=10).grid(row=0, column=1, sticky='w', padx=5, pady=5)
+        
+        ttk.Button(advanced_frame, text="Browse ADB Path", 
+                  command=self.browse_adb_path).grid(row=1, column=0, columnspan=2, pady=5)
+        
+    def create_logs_tab(self):
+        # Log text area
+        log_frame = ttk.LabelFrame(self.logs_tab, text="Live Logs", padding=10)
+        log_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=20, state='disabled')
+        self.log_text.pack(fill='both', expand=True)
+        
+        # Log controls
+        control_frame = ttk.Frame(log_frame)
+        control_frame.pack(fill='x', pady=5)
+        
+        ttk.Button(control_frame, text="Clear Logs", 
+                  command=self.clear_logs).pack(side='left', padx=5)
+        
+        ttk.Button(control_frame, text="Save Logs", 
+                  command=self.save_logs).pack(side='left', padx=5)
+        
+    def on_profile_change(self, event):
+        self.current_profile = self.profile_var.get()
+        logging.info(f"Profile changed to: {self.current_profile}")
+        
+    def check_adb_status(self):
+        connected, message = self.adb_helper.check_device_connected()
+        status_text = f"ADB: {message}"
+        self.adb_status.config(text=status_text)
+        return connected
+        
+    def install_certificate(self):
+        if not self.check_adb_status():
+            messagebox.showerror("Error", "No device connected via ADB")
+            return
+            
         try:
-            result = subprocess.run(
-                command if not shell else command,
-                shell=shell,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            return result.returncode == 0, result.stdout, result.stderr
-        except subprocess.TimeoutExpired:
-            return False, "", "Command timed out"
+            # Download certificate
+            response = requests.get(CERTIFICATE_URL)
+            if response.status_code == 200:
+                # Save to temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.cer') as f:
+                    f.write(response.content)
+                    cert_path = f.name
+                
+                # Install certificate
+                success, message = self.adb_helper.install_certificate(cert_path)
+                
+                # Clean up
+                os.unlink(cert_path)
+                
+                if success:
+                    self.cert_status.config(text="Certificate: Installed")
+                    messagebox.showinfo("Success", message)
+                else:
+                    messagebox.showerror("Error", message)
+            else:
+                messagebox.showerror("Error", "Failed to download certificate")
         except Exception as e:
-            return False, "", str(e)
-    
-    def check_connection(self):
-        self.log_message("Checking ADB connection...")
-        success, stdout, stderr = self.run_command([self.adb_path.get(), "devices"])
-        if success:
-            devices = [line for line in stdout.split('\n') if line.strip() and not line.startswith('List')]
-            if devices:
-                self.log_message(f"Connected devices: {len(devices)}")
-                for device in devices:
-                    self.log_message(f"  {device}")
+            messagebox.showerror("Error", f"Certificate installation failed: {str(e)}")
+            
+    def set_proxy(self):
+        if not self.check_adb_status():
+            messagebox.showerror("Error", "No device connected via ADB")
+            return
+            
+        try:
+            port = int(self.port_var.get())
+            success, message = self.adb_helper.set_proxy("127.0.0.1", port)
+            if success:
+                messagebox.showinfo("Success", message)
             else:
-                self.log_message("No devices connected")
-        else:
-            self.log_message(f"ADB error: {stderr}")
-    
-    def show_advanced_methods(self):
-        advanced_window = tk.Toplevel(self.root)
-        advanced_window.title("Advanced Bypass Methods")
-        advanced_window.geometry("600x500")
+                messagebox.showerror("Error", message)
+        except ValueError:
+            messagebox.showerror("Error", "Invalid port number")
+        except Exception as e:
+            messagebox.showerror("Error", f"Proxy setup failed: {str(e)}")
+            
+    def clear_proxy(self):
+        if not self.check_adb_status():
+            messagebox.showerror("Error", "No device connected via ADB")
+            return
+            
+        try:
+            success, message = self.adb_helper.clear_proxy()
+            if success:
+                messagebox.showinfo("Success", message)
+            else:
+                messagebox.showerror("Error", message)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to clear proxy: {str(e)}")
+            
+    def full_auto_setup(self):
+        if not self.check_adb_status():
+            messagebox.showerror("Error", "No device connected via ADB")
+            return
+            
+        # Install certificate
+        self.install_certificate()
         
-        ttk.Label(advanced_window, text="Manual Steps Required:", font=("Arial", 12, "bold")).pack(pady=10)
+        # Set proxy
+        self.set_proxy()
         
-        methods = [
-            "1. Install MagiskHide Props Config module in Magisk",
-            "2. Use terminal: props -> 1 -> f -> 28 (Asus) -> 3 (ROG Phone 2)",
-            "3. Reboot after configuration",
-            "4. Enable Zygisk in Magisk settings",
-            "5. Add Free Fire to DenyList in Magisk",
-            "6. Install Shamiko module for better hiding",
-            "7. Use LSPosed with Hide My Applist module",
-            "8. Configure device fingerprint in build.prop manually if needed"
-        ]
+        # Start proxy
+        self.start_proxy()
         
-        for i, method in enumerate(methods):
-            ttk.Label(advanced_window, text=method, wraplength=550).pack(anchor=tk.W, pady=2, padx=10)
+        messagebox.showinfo("Setup Complete", "Full auto setup completed successfully!")
         
-        ttk.Button(advanced_window, text="Close", command=advanced_window.destroy).pack(pady=10)
-    
-    def show_module_help(self):
-        help_window = tk.Toplevel(self.root)
-        help_window.title("Module Installation Help")
-        help_window.geometry("700x400")
-        
-        ttk.Label(help_window, text="How to Install Magisk Modules:", font=("Arial", 12, "bold")).pack(pady=10)
-        
-        instructions = [
-            "1. Download modules from these GitHub links:",
-            "   - MagiskHide Props Config: https://github.com/Magisk-Modules-Repo/MagiskHidePropsConf",
-            "   - Universal SafetyNet Fix: https://github.com/kdrag0n/safetynet-fix",
-            "   - Shamiko: https://github.com/LSPosed/LSPosed/releases (look for Shamiko)",
-            "",
-            "2. Transfer the ZIP file to your emulator",
-            "3. Open Magisk Manager → Modules → Install from storage",
-            "4. Select the downloaded ZIP file",
-            "5. Reboot your emulator",
-            "",
-            "6. For Shamiko: After installing, enable Zygisk in Magisk settings",
-            "7. Add Free Fire to DenyList in Magisk",
-            "8. Reboot again for all changes to take effect"
-        ]
-        
-        for instruction in instructions:
-            ttk.Label(help_window, text=instruction, wraplength=650, justify=tk.LEFT).pack(anchor=tk.W, padx=10, pady=2)
-        
-        ttk.Button(help_window, text="Close", command=help_window.destroy).pack(pady=10)
-    
-    def reboot_device(self):
-        self.log_message("Rebooting device...")
-        success, stdout, stderr = self.run_command([self.adb_path.get(), "reboot"])
-        if success:
-            self.log_message("Device reboot initiated")
-            self.log_message("Please wait for device to restart and reconnect")
-        else:
-            self.log_message(f"Reboot failed: {stderr}")
-    
-    def start_bypass(self):
+    def start_proxy(self):
         if self.is_running:
             return
             
-        self.is_running = True
-        self.start_btn.config(state=tk.DISABLED)
-        self.stop_btn.config(state=tk.NORMAL)
-        
-        # Run bypass in a separate thread to avoid GUI freezing
-        thread = threading.Thread(target=self.execute_bypass)
-        thread.daemon = True
-        thread.start()
-    
-    def stop_bypass(self):
+        try:
+            port = int(self.port_var.get())
+            
+            # Create proxy instance
+            self.proxy = FreeFireProxy(self.current_profile)
+            
+            # Configure mitmproxy options
+            opts = options.Options(
+                listen_port=port,
+                ssl_insecure=True,
+                upstream_cert=False,
+                mode=['regular']
+            )
+            
+            # Start proxy in separate thread
+            self.is_running = True
+            self.proxy_thread = threading.Thread(target=self.run_proxy, args=(opts,))
+            self.proxy_thread.daemon = True
+            self.proxy_thread.start()
+            
+            self.start_btn.config(state='disabled')
+            self.stop_btn.config(state='normal')
+            self.proxy_status.config(text=f"Proxy: Running on port {port}")
+            
+            logging.info(f"Proxy server started on port {port}")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to start proxy: {str(e)}")
+            self.is_running = False
+            
+    def stop_proxy(self):
+        if not self.is_running:
+            return
+            
         self.is_running = False
-        self.start_btn.config(state=tk.NORMAL)
-        self.stop_btn.config(state=tk.DISABLED)
-        self.log_message("Bypass stopped")
-    
-    def execute_bypass(self):
-        self.log_message("Starting Free Fire bypass sequence...")
+        self.start_btn.config(state='normal')
+        self.stop_btn.config(state='disabled')
+        self.proxy_status.config(text="Proxy: Stopped")
         
-        # 1. Connect to emulator via ADB
-        self.log_message("Step 1: Connecting to emulator via ADB")
-        success, stdout, stderr = self.run_command([
-            self.adb_path.get(), "connect", f"127.0.0.1:{self.emulator_port.get()}"
-        ])
+        logging.info("Proxy server stopped")
         
-        if success:
-            self.log_message("ADB connection established")
-        else:
-            self.log_message(f"ADB connection failed: {stderr}")
-            self.stop_bypass()
-            return
-        
-        # 2. Check if device is rooted and Magisk is available
-        self.log_message("Step 2: Checking root access")
-        success, stdout, stderr = self.run_command([self.adb_path.get(), "shell", "su -c 'echo Root check'"])
-        
-        if success:
-            self.log_message("Root access confirmed")
+    def run_proxy(self, opts):
+        try:
+            master = dump.DumpMaster(opts)
+            master.addons.add(self.proxy)
             
-            # Check for Magisk
-            success, stdout, stderr = self.run_command([self.adb_path.get(), "shell", "su -c", '"which magisk"'])
-            if success and "magisk" in stdout:
-                self.log_message("Magisk detected")
+            while self.is_running:
+                master.run()
+                time.sleep(0.1)
                 
-                # Check Magisk version
-                success, stdout, stderr = self.run_command([self.adb_path.get(), "shell", "su -c", '"magisk -v"'])
-                if success:
-                    self.log_message(f"Magisk version: {stdout.strip()}")
-            else:
-                self.log_message("Magisk not found - some bypass methods may not work")
+        except Exception as e:
+            logging.error(f"Proxy error: {e}")
+            self.is_running = False
+            
+    def load_whitelist(self):
+        whitelist = load_whitelist()
+        self.whitelist_listbox.delete(0, tk.END)
+        for uid in whitelist:
+            self.whitelist_listbox.insert(tk.END, uid)
+            
+    def add_uid(self):
+        uid = self.uid_entry.get().strip()
+        if uid:
+            add_uid_to_whitelist(uid)
+            self.load_whitelist()
+            self.uid_entry.delete(0, tk.END)
+            logging.info(f"Added UID to whitelist: {uid}")
         else:
-            self.log_message("Root access not available - some bypass methods may not work")
-        
-        # 3. Spoof device properties (ROG Phone 2)
-        self.log_message("Step 3: Spoofing device properties as ROG Phone 2")
-        
-        # Try to remount system as read-write first
-        self.log_message("Attempting to remount system as read-write...")
-        success, stdout, stderr = self.run_command([
-            self.adb_path.get(), "shell", "su -c", '"mount -o remount,rw /system"'
-        ])
-        
-        if success:
-            self.log_message("System remounted as read-write")
+            messagebox.showwarning("Warning", "Please enter a UID")
             
-            # Modify build.prop directly
-            rog2_props = {
-                "ro.product.model": "ASUS_I001DC",
-                "ro.product.brand": "asus",
-                "ro.product.name": "WW_I001D",
-                "ro.product.device": "ASUS_I001_1",
-                "ro.build.product": "ASUS_I001_1",
-                "ro.build.fingerprint": "asus/WW_I001D/ASUS_I001_1:10/QQ2A.200405.005/20.10.7.57:user/release-keys",
-                "ro.build.description": "WW_I001D-user 10 QQ2A.200405.005 20.10.7.57 release-keys"
-            }
+    def remove_uid(self):
+        selection = self.whitelist_listbox.curselection()
+        if selection:
+            uid = self.whitelist_listbox.get(selection[0])
+            whitelist = load_whitelist()
+            if uid in whitelist:
+                whitelist.remove(uid)
+                save_whitelist(whitelist)
+                self.load_whitelist()
+                logging.info(f"Removed UID from whitelist: {uid}")
+        else:
+            messagebox.showwarning("Warning", "Please select a UID to remove")
             
-            for prop, value in rog2_props.items():
-                # First try to find and replace existing property
-                success, stdout, stderr = self.run_command([
-                    self.adb_path.get(), "shell", "su -c", f'"sed -i \\"s/^{prop}=.*/{prop}={value}/\\" /system/build.prop"'
-                ])
+    def clear_whitelist(self):
+        if messagebox.askyesno("Confirm", "Clear all UIDs from whitelist?"):
+            save_whitelist([])
+            self.load_whitelist()
+            logging.info("Cleared all UIDs from whitelist")
+            
+    def browse_adb_path(self):
+        path = filedialog.askopenfilename(
+            title="Select ADB executable",
+            filetypes=[("ADB executable", "adb*"), ("All files", "*.*")]
+        )
+        if path:
+            self.adb_helper.adb_path = path
+            self.check_adb_status()
+            
+    def clear_logs(self):
+        self.log_text.config(state='normal')
+        self.log_text.delete(1.0, tk.END)
+        self.log_text.config(state='disabled')
+        
+    def save_logs(self):
+        path = filedialog.asksaveasfilename(
+            title="Save logs",
+            defaultextension=".log",
+            filetypes=[("Log files", "*.log"), ("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        if path:
+            try:
+                with open(path, 'w') as f:
+                    f.write(self.log_text.get(1.0, tk.END))
+                messagebox.showinfo("Success", "Logs saved successfully")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to save logs: {str(e)}")
                 
-                if not success:
-                    # If property doesn't exist, append it
-                    success, stdout, stderr = self.run_command([
-                        self.adb_path.get(), "shell", "su -c", f'"echo \\"{prop}={value}\\" >> /system/build.prop"'
-                    ])
-                    if success:
-                        self.log_message(f"Added {prop} = {value} to build.prop")
-                    else:
-                        self.log_message(f"Failed to add {prop}: {stderr}")
-                else:
-                    self.log_message(f"Modified {prop} = {value} in build.prop")
-        else:
-            self.log_message("Could not remount system as read-write - using alternative methods")
+    def log_message(self, message):
+        """Add message to log text area"""
+        self.log_text.config(state='normal')
+        self.log_text.insert(tk.END, message + '\n')
+        self.log_text.see(tk.END)
+        self.log_text.config(state='disabled')
+
+# Custom log handler for GUI
+class GUIHandler(logging.Handler):
+    def __init__(self, gui):
+        super().__init__()
+        self.gui = gui
         
-        # 4. Hide root from target apps - FIXED APPROACH
-        self.log_message("Step 4: Configuring root hiding (Fixed Approach)")
-        
-        # Check for Magisk
-        success, stdout, stderr = self.run_command([
-            self.adb_path.get(), "shell", "su -c", '"which magisk"'
-        ])
-        
-        if success and "magisk" in stdout:
-            self.log_message("Magisk detected - configuring Magisk Hide")
-            
-            # Check if Zygisk is available (Magisk v24+)
-            success, stdout, stderr = self.run_command([
-                self.adb_path.get(), "shell", "su -c", '"magisk --zygote"'
-            ])
-            
-            if success:
-                self.log_message("Zygisk detected - using DenyList")
-                # Add Free Fire to DenyList
-                success, stdout, stderr = self.run_command([
-                    self.adb_path.get(), "shell", "su -c", '"magisk --denylist add com.dts.freefireth"'
-                ])
-                if success:
-                    self.log_message("Free Fire added to Magisk DenyList")
-                else:
-                    self.log_message("Could not add Free Fire to DenyList")
-            else:
-                # Use older MagiskHide for older Magisk versions
-                success, stdout, stderr = self.run_command([
-                    self.adb_path.get(), "shell", "su -c", '"magiskhide enable"'
-                ])
-                if success:
-                    self.log_message("Magisk Hide enabled")
-                
-                # Add Free Fire to hide list
-                success, stdout, stderr = self.run_command([
-                    self.adb_path.get(), "shell", "su -c", '"magiskhide add com.dts.freefireth"'
-                ])
-                if success:
-                    self.log_message("Free Fire added to Magisk Hide")
-                else:
-                    self.log_message("Could not add Free Fire to Magisk Hide")
-        else:
-            self.log_message("Magisk not found - using alternative root hiding methods")
-            
-            # Find and hide actual Magisk binaries instead of symlinks
-            magisk_paths = [
-                "/data/adb/magisk/magisk",
-                "/sbin/magisk",
-                "/dev/magisk",
-                "/system/xbin/magisk"
-            ]
-            
-            for path in magisk_paths:
-                success, stdout, stderr = self.run_command([
-                    self.adb_path.get(), "shell", "su -c", f'"[ -f {path} ] && chmod 000 {path}"'
-                ])
-                if success:
-                    self.log_message(f"Hidden Magisk binary: {path}")
-            
-            # Also hide su binaries
-            su_paths = [
-                "/system/bin/su",
-                "/system/xbin/su",
-                "/sbin/su",
-                "/vendor/bin/su"
-            ]
-            
-            for path in su_paths:
-                # First check if it's a file (not symlink)
-                success, stdout, stderr = self.run_command([
-                    self.adb_path.get(), "shell", "su -c", f'"[ -f {path} ] && chmod 000 {path}"'
-                ])
-                if success:
-                    self.log_message(f"Hidden su binary: {path}")
-        
-        # 5. Spoof UID/IMEI
-        self.log_message("Step 5: Spoofing device identifiers")
-        
-        # Generate random IMEI
-        imei = ''.join([str(random.randint(0, 9)) for _ in range(15)])
-        success, stdout, stderr = self.run_command([
-            self.adb_path.get(), "shell", "su -c", f'"setprop persist.radio.imei {imei}"'
-        ])
-        
-        if success:
-            self.log_message(f"Spoofed IMEI: {imei}")
-        else:
-            self.log_message("Failed to spoof IMEI")
-        
-        # 6. Disable debugging detection
-        self.log_message("Step 6: Disabling debugging detection")
-        
-        # These properties might be read-only, but we try anyway
-        debug_props = {
-            "ro.adb.secure": "1",
-            "persist.sys.usb.config": "none",
-            "ro.secure": "1"
-        }
-        
-        for prop, value in debug_props.items():
-            success, stdout, stderr = self.run_command([
-                self.adb_path.get(), "shell", "su -c", f'"setprop {prop} {value}"'
-            ])
-            if success:
-                self.log_message(f"Set {prop} = {value}")
-            else:
-                self.log_message(f"Failed to set {prop}: {stderr}")
-        
-        # 7. Hide emulator-specific artifacts based on emulator type
-        self.log_message("Step 7: Hiding emulator artifacts")
-        
-        emulator_type = self.emulator_type.get()
-        emulator_files = self.get_emulator_files(emulator_type)
-        
-        for file_path in emulator_files:
-            # Check if file exists
-            success, stdout, stderr = self.run_command([
-                self.adb_path.get(), "shell", "su -c", f'"[ -e {file_path} ] && echo exists"'
-            ])
-            
-            if success and "exists" in stdout:
-                # Hide the file
-                success, stdout, stderr = self.run_command([
-                    self.adb_path.get(), "shell", "su -c", f'"mv {file_path} {file_path}.bak"'
-                ])
-                if success:
-                    self.log_message(f"Hidden {file_path}")
-                else:
-                    self.log_message(f"Could not hide {file_path}: {stderr}")
-            else:
-                self.log_message(f"{file_path} does not exist")
-        
-        # 8. Additional security measures
-        self.log_message("Step 8: Applying additional security measures")
-        
-        # Clear logs and caches
-        clear_commands = [
-            "logcat -c",
-            "dmesg -c",
-            "rm -rf /data/local/tmp/*",
-            "rm -rf /data/data/com.dts.freefireth/cache/*",
-            "pm clear com.dts.freefireth"
-        ]
-        
-        for cmd in clear_commands:
-            success, stdout, stderr = self.run_command([
-                self.adb_path.get(), "shell", "su -c", f'"{cmd}"'
-            ])
-            if success:
-                self.log_message(f"Executed: {cmd}")
-        
-        self.log_message("Bypass sequence completed!")
-        self.log_message("You can now launch Free Fire on your emulator")
-        self.log_message("Note: Some changes may require a reboot to take effect")
+    def emit(self, record):
+        log_entry = self.format(record)
+        self.gui.log_message(log_entry)
+
+# Main application
+def main():
+    root = tk.Tk()
+    app = FreeFireProxyGUI(root)
     
-    def get_emulator_files(self, emulator_type):
-        # Return emulator-specific files to hide
-        files = {
-            "LDPlayer": [
-                "/system/bin/ldplayer", "/system/bin/ld", "/system/bin/ldnetchange",
-                "/system/app/LDPlayer", "/system/priv-app/LDPlayer", "/system/lib/libldplayer.so"
-            ],
-            "Nox": [
-                "/system/bin/nox", "/system/bin/noxvm", "/system/bin/noxd",
-                "/system/app/Nox", "/system/priv-app/Nox", "/system/lib/libnox.so"
-            ],
-            "BlueStacks": [
-                "/system/bin/bluestacks", "/system/bin/bst", "/system/bin/bstvm",
-                "/system/app/BlueStacks", "/system/priv-app/BlueStacks", "/system/lib/libbst.so"
-            ],
-            "Memu": [
-                "/system/bin/memu", "/system/bin/memuvm", "/system/bin/memud",
-                "/system/app/MEmu", "/system/priv-app/MEmu", "/system/lib/libmemu.so"
-            ],
-            "Generic": [
-                "/system/bin/qemu-props", "/system/bin/qemu-arm", "/system/bin/qemu-i386",
-                "/system/lib/libc_malloc_debug_qemu.so", "/system/bin/genymotion",
-                "/system/bin/androVM_setprop", "/system/bin/vbox", "/system/bin/vms"
-            ]
-        }
-        
-        return files.get(emulator_type, files["Generic"])
+    # Add GUI log handler
+    gui_handler = GUIHandler(app)
+    gui_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logging.getLogger().addHandler(gui_handler)
     
-    def on_closing(self):
-        if self.is_running:
-            self.stop_bypass()
-        self.root.destroy()
+    # Handle application close
+    def on_closing():
+        if app.is_running:
+            app.stop_proxy()
+        root.destroy()
+    
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+    root.mainloop()
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = FreeFireBypassTool(root)
-    root.protocol("WM_DELETE_WINDOW", app.on_closing)
-    root.mainloop()
+    main()
